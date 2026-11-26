@@ -284,7 +284,7 @@ fn bench_cbv_snapshot_bindings() {
                 }
 
                 state.set_table(true, 1, heap(title.0).handle(i as u32 * 2).unwrap());
-                let made = state.tables(&list, &used, &[], true, &[], &mut Vec::new());
+                let made = state.tables(&list, &used, &[], &[], true, &[], &mut Vec::new());
                 let [(1, offset)] = made[..] else {
                     panic!("unexpected table {made:?}")
                 };
@@ -381,15 +381,15 @@ fn a_cut_records_a_new_snapshot_even_with_the_same_table() {
     state.set_heaps(&[title.0]);
     state.set_table(true, 1, heap(title.0).handle(0).unwrap());
     let before = device.new_list().unwrap();
-    let first = state.tables(&before, &layout, &[], true, &[], &mut Vec::new());
+    let first = state.tables(&before, &layout, &[], &[], true, &[], &mut Vec::new());
     let after = device.new_list().unwrap();
     state.replay(&after);
-    let next = state.tables(&after, &layout, &[], true, &[], &mut Vec::new());
+    let next = state.tables(&after, &layout, &[], &[], true, &[], &mut Vec::new());
     assert_ne!(first, next);
     assert_eq!(before.constant_bench_allocations().0, 1);
     assert_eq!(after.constant_bench_allocations().0, 1);
     after.defer_at(data.0.as_ptr() as usize, 256, || {});
-    let post_write = state.tables(&after, &layout, &[], true, &[], &mut Vec::new());
+    let post_write = state.tables(&after, &layout, &[], &[], true, &[], &mut Vec::new());
     assert_ne!(next, post_write);
     assert_eq!(after.constant_bench_allocations().0, 2);
 }
