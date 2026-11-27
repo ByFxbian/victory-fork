@@ -32,6 +32,8 @@ mod halves;
 
 #[path = "paired.rs"]
 mod paired;
+#[path = "paired_fp32.rs"]
+mod paired_fp32;
 pub(super) use paired::{accesses_lds, supports_paired_lds};
 /// Threads past a `DispatchX` thread count (`USER_DISPATCH_THREADS`), a
 /// child module so it shares the emitter's state (fork pull request #646).
@@ -316,6 +318,7 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    paired_fp32: bool,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -949,101 +952,9 @@ fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
     }
 }
 
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
-    let n = st.exits.len();
-    let succ = |b: usize| -> Vec<usize> {
-        match st.exits[b] {
-            LaneExit::Jump(t) => vec![t],
-            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
-            LaneExit::End | LaneExit::Indirect => Vec::new(),
-        }
-    };
-    // regions: blocks not every lane runs, joined by the edges between them
-    let mut region: Vec<usize> = (0..n).collect();
-    fn find(region: &mut [usize], mut b: usize) -> usize {
-        while region[b] != b {
-            region[b] = region[region[b]];
-            b = region[b];
-        }
-        b
-    }
-    for b in 0..n {
-        for t in succ(b) {
-            if !all[b] && !all[t] {
-                let (x, y) = (find(&mut region, b), find(&mut region, t));
-                region[x] = y;
-            }
-        }
-    }
-    // per region: LDS reads, LDS writes
-    let mut reads = vec![false; n];
-    let mut writes = vec![false; n];
-    for (b, block) in p.blocks.iter().enumerate().take(n) {
-        if all[b] {
-            continue;
-        }
-        let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
-            if name.starts_with("ds_read") {
-                reads[r] = true;
-            } else {
-                writes[r] = true;
-            }
-        }
-    }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
-            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
-                let mut list = Vec::new();
-                for (b, block) in p.blocks.iter().enumerate().take(n) {
-                    if all[b] || find(&mut region, b) != r {
-                        continue;
-                    }
-                    for i in &block.insts {
-                        let name = i.name();
-                        if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                            continue;
-                        }
-                        // the address register and the instruction that wrote it
-                        let addr = match &i.fields {
-                            Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } => {
-                                let made = i.read(Reg::V(*reg)).and_then(|v| {
-                                    p.blocks
-                                        .iter()
-                                        .flat_map(|bl| &bl.insts)
-                                        .find(|x| x.writes.iter().any(|w| w.1 == v))
-                                        .map(|x| format!("{:#x} {}", x.machine.offset, x.name()))
-                                });
-                                format!("v{reg} off {offset0}/{offset1} made by {}", made.as_deref().unwrap_or("an input or a phi"))
-                            }
-                            _ => "no address".to_string(),
-                        };
-                        list.push(format!("{:#x} {name} [{addr}]", i.machine.offset));
-                    }
-                }
-                eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
-            }
-        }
-        return None;
-    }
-    let mut meet = vec![(false, false); n];
-    for b in 0..n {
-        for t in succ(b) {
-            if all[b] && !all[t] {
-                let r = find(&mut region, t);
-                meet[b].1 |= reads[r] || writes[r];
-            } else if !all[b] && all[t] {
-                let r = find(&mut region, b);
-                meet[t].0 |= reads[r] || writes[r];
-            }
-        }
-    }
-    Some(meet)
-}
+#[path = "lds_regions.rs"]
+mod lds_regions;
+use lds_regions::lds_meetings;
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
@@ -1755,6 +1666,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            paired_fp32: false,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -2469,6 +2381,10 @@ impl<'a> Lower<'a> {
                     self.inst(b, i)?;
                 }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    if self.twin.is_some() && self.replay_paired_fp32(b, i, end)? {
+                        i = end;
+                        continue;
+                    }
                     for j in i + 1..end {
                         if self.twin.is_some() {
                             self.paired_section_inst(b, j, i);
@@ -7468,6 +7384,11 @@ impl<'a> Lower<'a> {
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
+                if self.paired_fp32 && matches!(name, "v_add_f32" | "v_min_f32" | "v_max_f32") {
+                    let (a, b) = (s(self, 0)?, s(self, 1)?);
+                    let r = self.paired_fp32_op(name, a, b);
+                    return int(self, r);
+                }
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let r = match name {
                     "v_add_f32" => self.s.m.bin(c, Bin::Add, a, bb),

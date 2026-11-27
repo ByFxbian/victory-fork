@@ -440,6 +440,10 @@ impl<'a> Lower<'a> {
     fn paired_shape(&mut self, shape: super::super::wave::Shape) -> Result<[V; 2], Why> {
         use super::super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
+            Shape::ActiveF64(..) => return Err("a paired FP64 reduction"),
+            Shape::Prefix(Op::AddF | Op::AddH | Op::MinF | Op::MaxF, ..) => {
+                return Err("a paired floating-point prefix");
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
